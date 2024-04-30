@@ -58,6 +58,7 @@ import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.alias
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.intLiteral
+import org.jetbrains.exposed.sql.or
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
 import java.lang.Integer.toHexString
@@ -101,11 +102,20 @@ class SearchApi {
         @Description("Tag query, separated by `,` (and) or `|` (or). Excluded tags are prefixed with `!`.")
         val tags: String? = null,
         @Ignore val mapper: Int? = null,
-        @Ignore val curator: Int? = null
+        @Ignore val curator: Int? = null,
+        val operator: String = "AND",
     )
 }
 
-fun <T> Op<Boolean>.notNull(b: T?, block: (T) -> Op<Boolean>) = if (b == null) this else this.and(block(b))
+fun <T> Op<Boolean>.notNull(b: T?, connectiveOperator: String = "AND", block: (T) -> Op<Boolean>): Op<Boolean> =
+    if (b == null) {
+        this
+    } else {
+        when (connectiveOperator.lowercase()) {
+            "or" -> this.or(block(b))
+            else -> this.and(block(b)) // default to and
+        }
+    }
 
 class SearchParams(
     val escapedQuery: String?,
@@ -246,14 +256,41 @@ fun Route.searchRoute() {
                                             .slice(intLiteral(1))
                                             .select {
                                                 (Versions.mapId eq Beatmap.id) and (Versions.state eq EMapState.Published)
-                                                    .notNull(it.minNps) { o -> (Difficulty.nps greaterEqF o) }
-                                                    .notNull(it.maxNps) { o -> (Difficulty.nps lessEqF o) }
+                                                    .notNull(it.minNps, it.operator) { o -> (Difficulty.nps greaterEqF o) }
+                                                    .notNull(it.maxNps, it.operator) { o -> (Difficulty.nps lessEqF o) }
                                             }
                                             .limit(1)
                                             .lateral().alias("diff")
                                     )
                                     .slice(Beatmap.id)
                                     .select {
+                                        val neutralElement = if(it.operator.lowercase() == "OR") Op.FALSE else Op.TRUE;
+                                        val disjunctableCondition = neutralElement.notNull(searchInfo.userSubQuery, it.operator) { o -> Beatmap.uploader inSubQuery o }
+                                            .notNull(followingSubQuery, it.operator) { o -> Beatmap.uploader inSubQuery o }
+                                            .notNull(it.chroma, it.operator) { o -> Beatmap.chroma eq o }
+                                            .notNull(it.noodle, it.operator) { o -> Beatmap.noodle eq o }
+                                            .notNull(it.ranked, it.operator) { o -> Beatmap.ranked eq o }
+                                            .notNull(it.curated, it.operator) { o -> with(Beatmap.curatedAt) { if (o) isNotNull() else isNull() } }
+                                            .notNull(it.verified, it.operator) { o -> User.verifiedMapper eq o }
+                                            .notNull(it.fullSpread, it.operator) { o -> Beatmap.fullSpread eq o }
+                                            .notNull(it.minNps, it.operator) { o -> (Beatmap.maxNps greaterEqF o) }
+                                            .notNull(it.maxNps, it.operator) { o -> (Beatmap.minNps lessEqF o) }
+                                            .notNull(it.minDuration, it.operator) { o -> Beatmap.duration greaterEq o }
+                                            .notNull(it.maxDuration, it.operator) { o -> Beatmap.duration lessEq o }
+                                            .notNull(it.minRating, it.operator) { o -> Beatmap.score greaterEqF o }
+                                            .notNull(it.maxRating, it.operator) { o -> Beatmap.score lessEqF o }
+                                            .notNull(it.minBpm, it.operator) { o -> Beatmap.bpm greaterEq o }
+                                            .notNull(it.maxBpm, it.operator) { o -> Beatmap.bpm lessEq o }
+                                            .notNull(it.from, it.operator) { o -> Beatmap.uploaded greaterEq o.toJavaInstant() }
+                                            .notNull(it.to, it.operator) { o -> Beatmap.uploaded lessEq o.toJavaInstant() }
+                                            .notNull(it.me, it.operator) { o -> Beatmap.me eq o }
+                                            .notNull(it.cinema, it.operator) { o -> Beatmap.cinema eq o }
+                                            .notNull(it.tags, it.operator) { o ->
+                                                o.toQuery()?.applyToQuery() ?: Op.TRUE
+                                            }
+                                            .notNull(it.mapper, it.operator) { o -> Beatmap.uploader eq o }
+                                            .notNull(it.curator, it.operator) { o -> Beatmap.curator eq o }
+
                                         Beatmap.deletedAt.isNull()
                                             .let { q -> searchInfo.applyQuery(q) }
                                             .let { q ->
@@ -263,32 +300,7 @@ fun Route.searchRoute() {
                                                     false -> q.and(Beatmap.declaredAi neq AiDeclarationType.None)
                                                     null -> q.and(Beatmap.declaredAi eq AiDeclarationType.None)
                                                 }
-                                            }
-                                            .notNull(searchInfo.userSubQuery) { o -> Beatmap.uploader inSubQuery o }
-                                            .notNull(followingSubQuery) { o -> Beatmap.uploader inSubQuery o }
-                                            .notNull(it.chroma) { o -> Beatmap.chroma eq o }
-                                            .notNull(it.noodle) { o -> Beatmap.noodle eq o }
-                                            .notNull(it.ranked) { o -> Beatmap.ranked eq o }
-                                            .notNull(it.curated) { o -> with(Beatmap.curatedAt) { if (o) isNotNull() else isNull() } }
-                                            .notNull(it.verified) { o -> User.verifiedMapper eq o }
-                                            .notNull(it.fullSpread) { o -> Beatmap.fullSpread eq o }
-                                            .notNull(it.minNps) { o -> (Beatmap.maxNps greaterEqF o) }
-                                            .notNull(it.maxNps) { o -> (Beatmap.minNps lessEqF o) }
-                                            .notNull(it.minDuration) { o -> Beatmap.duration greaterEq o }
-                                            .notNull(it.maxDuration) { o -> Beatmap.duration lessEq o }
-                                            .notNull(it.minRating) { o -> Beatmap.score greaterEqF o }
-                                            .notNull(it.maxRating) { o -> Beatmap.score lessEqF o }
-                                            .notNull(it.minBpm) { o -> Beatmap.bpm greaterEq o }
-                                            .notNull(it.maxBpm) { o -> Beatmap.bpm lessEq o }
-                                            .notNull(it.from) { o -> Beatmap.uploaded greaterEq o.toJavaInstant() }
-                                            .notNull(it.to) { o -> Beatmap.uploaded lessEq o.toJavaInstant() }
-                                            .notNull(it.me) { o -> Beatmap.me eq o }
-                                            .notNull(it.cinema) { o -> Beatmap.cinema eq o }
-                                            .notNull(it.tags) { o ->
-                                                o.toQuery()?.applyToQuery() ?: Op.TRUE
-                                            }
-                                            .notNull(it.mapper) { o -> Beatmap.uploader eq o }
-                                            .notNull(it.curator) { o -> Beatmap.curator eq o }
+                                            }.and(disjunctableCondition)
                                     }
                                     .orderBy(*sortArgs)
                                     .limit(it.page)
